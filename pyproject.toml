@@ -10,6 +10,14 @@ version = "0.1.0"
 description = "OpenCode deHarness: use the opencode provider from Python, shaped exactly like the desktop client. No harness, no login."
 readme = "README.md"
 requires-python = ">=3.10"
+authors = [{name = "calez"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+urls = {Homepage = "https://github.com/YOU/opencode-deharness", Repository = "https://github.com/YOU/opencode-deharness"}
 dependencies = ["requests>=2.28"]
 
 [project.optional-dependencies]
