@@ -25,5 +25,3 @@ Everything formable is settable (module property + per-call kwarg, `None`
 means the property): `MODEL`, `TIMEOUT`, `RETRIES`, `RETRY_DELAY`,
 `REASONING_EFFORT`. Session files land in your working directory by default
 (pass `files_dir=` to put them elsewhere).
-
-Full docs: https://github.com/YOU/zen-free
