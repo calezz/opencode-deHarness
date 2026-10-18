@@ -22,11 +22,30 @@ UPSTREAM = "https://opencode.ai"
 PATH_RESPONSES = "/inference/v1/responses"
 PATH_MODELS = "/inference/v1/models"
 PATH_SYSTEMONE = "/inference/v1/systemone"
+# Protocol-family endpoints (v2.0.30+ layout, see opencode-src commit 1ca34ae):
+# the client picks the endpoint per model from models.dev `provider.npm`.
+PATH_CHAT = "/inference/openai/v1/chat/completions"
+CHAT_SUFFIX = "/chat/completions"
+# Endpoint family per models.dev npm package (the live feed decides, never a
+# hardcoded model list): opencode free models are all @ai-sdk/openai-compatible
+# today, legacy ones were @ai-sdk/openai (responses), and paywalled claude/
+# gemini/qwen entries use the anthropic/google families (chain sessions only
+# support chat/responses).
+PROTOCOL_FAMILY = {
+    "@ai-sdk/openai-compatible": "chat",
+    "@ai-sdk/openai": "responses",
+    "@ai-sdk/anthropic": "anthropic",
+    "@ai-sdk/google": "google",
+}
+# models.dev feed: the same public data the client loads (bundled snapshot at
+# 2.0.30+; fetched live here with a cache beside this file).
+MODELS_DEV = "https://models.dev/api.json"
+MODELS_DEV_TTL = 12 * 3600.0
 MODEL = "muse-spark-1.3-contributor-free"
 TIMEOUT = 180
 MODELS_TIMEOUT = 30
 EVAL_TIMEOUT = 60
-CLIENT_VERSION = "2.0.29"
+CLIENT_VERSION = "2.0.32"
 RETRIES = 2
 RETRY_DELAY = 1.0
 REASONING_EFFORT = "xhigh"
@@ -174,6 +193,108 @@ def _template_path(files_dir: str) -> str:
     return os.path.join(_HERE, "template-main-body.json")
 
 
+def _chat_main_template() -> tuple:
+    """The captured turn-1 MAIN chat frame packaged as
+    template-chat-main.json: {"system": <full harness system prompt>,
+    "tools": [<client tool catalog>]}. The gate's main-shape check keys on
+    exactly these two pieces; max_completion_tokens resolves dynamically
+    from the feed per model."""
+    with open(os.path.join(_HERE, "template-chat-main.json"), encoding="utf-8") as f:
+        tmpl = json.load(f)
+    return tmpl["system"], tmpl.get("tools") or []
+
+
+_SNAP_CACHE: tuple | None = None  # (fetched_at, providers)
+
+
+def _models_dev(force: bool = False):
+    """Live models.dev provider feed, cached in-memory and to
+    models-dev-cache.json beside this file. The client itself loads this data
+    to pick endpoints, so protocols are never hardcoded here. A stale cache
+    beats a dead network; a cold network with no cache returns None."""
+    global _SNAP_CACHE
+    now = time.time()
+    if not force and _SNAP_CACHE and now - _SNAP_CACHE[0] < MODELS_DEV_TTL:
+        return _SNAP_CACHE[1]
+    cache = os.path.join(_HERE, "models-dev-cache.json")
+    cached = None
+    if os.path.exists(cache):
+        try:
+            with open(cache, encoding="utf-8") as f:
+                cached = json.load(f)
+        except Exception:
+            cached = None
+    if not force and cached and now - cached.get("fetched_at", 0) < MODELS_DEV_TTL:
+        _SNAP_CACHE = (cached.get("fetched_at", now), cached.get("providers"))
+        return _SNAP_CACHE[1]
+    try:
+        r = requests.get(MODELS_DEV, timeout=10)
+        r.raise_for_status()
+        providers = r.json()
+    except Exception:
+        if cached:
+            return cached.get("providers")
+        return _SNAP_CACHE[1] if _SNAP_CACHE else None
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump({"fetched_at": now, "providers": providers}, f)
+    _SNAP_CACHE = (now, providers)
+    return providers
+
+
+def model_protocol(model_id: str) -> tuple:
+    """(family, target_url) for a model, resolved from the live models.dev
+    feed the same way the client routes it: per-model `provider.npm`/`api`
+    win over provider-level values. Unknown models (e.g. systemone-eval ids
+    absent from the feed) keep the legacy flat responses path."""
+    providers = _models_dev() or {}
+    entry = providers.get("opencode") or {}
+    mentry = (entry.get("models") or {}).get(model_id) or {}
+    per_model = mentry.get("provider") or {}
+    npm = per_model.get("npm") or entry.get("npm")
+    base = per_model.get("api") or entry.get("api")
+    family = PROTOCOL_FAMILY.get(npm, "responses")
+    if family == "chat":
+        url = (base.rstrip("/") + CHAT_SUFFIX) if base else UPSTREAM + PATH_CHAT
+        return "chat", url
+    if family != "responses":
+        return family, base  # supported only as an explicit error in _send
+    return "responses", (base or None)
+
+
+def model_target(model_id: str) -> str:
+    """Absolute POST URL for a model's family; responses stays on the legacy
+    flat path the gate has always validated."""
+    family, target = model_protocol(model_id)
+    if family == "responses":
+        return UPSTREAM + PATH_RESPONSES
+    return target
+
+
+def free_models(timeout=10) -> list:
+    """Free model IDs from the live models.dev feed (zero input/output cost).
+    New free models show up automatically - no caller-side lists."""
+    providers = _models_dev() or {}
+    out = []
+    for mid, meta in sorted((providers.get("opencode") or {}).get("models", {}).items()):
+        cost = meta.get("cost") or {}
+        if cost.get("input", 0) == 0 and cost.get("output", 0) == 0:
+            out.append(mid)
+    return out
+
+
+def first_text_of(body: dict) -> str:
+    """Last user text in a responses-style input list, for chat translation."""
+    items = body.get("input")
+    if not isinstance(items, list) or not items:
+        return ""
+    texts: list = []
+    for item in items:
+        for part in (item.get("content") or []) if isinstance(item, dict) else []:
+            if isinstance(part, dict) and part.get("text"):
+                texts.append(str(part["text"]))
+    return texts[-1] if texts else ""
+
+
 def _send(path: str, headers: dict, body: dict, proxy: str | None = None,
           timeout=None, retries=None, retry_delay=None,
           model: str | None = None) -> dict:
@@ -183,8 +304,73 @@ def _send(path: str, headers: dict, body: dict, proxy: str | None = None,
     if model is not None:
         body = dict(body)
         body["model"] = _resolve_model(model)
+    # Trace headers: the captured client runs share ONE 32-hex trace id
+    # per session (across requests and processes) and mint a fresh 16-hex
+    # span per request. So: absent -> stamp a fresh pair; present (a saved
+    # session trace) -> keep the trace id, refresh only the span.
+    if "b3" not in headers:
+        headers = dict(headers)
+        trace_id = secrets.token_hex(16)
+        span_id = secrets.token_hex(8)
+        headers["b3"] = f"{trace_id}-{span_id}-1-{secrets.token_hex(8)}"
+        headers["traceparent"] = f"00-{trace_id}-{span_id}-01"
+    elif "traceparent" in headers:
+        headers = dict(headers)
+        stage, trace_id, _, flags = headers["traceparent"].split("-")
+        span_id = secrets.token_hex(8)
+        headers["traceparent"] = f"{stage}-{trace_id}-{span_id}-{flags}"
+        headers["b3"] = (headers["b3"].split("-")[0] + "-" + span_id
+                         + "-1-" + secrets.token_hex(8))
+    # Protocol routing, resolved live from models.dev (never a hardcoded
+    # list): chat-family models get the protocol-family endpoint and a
+    # translated body; everything else keeps the legacy responses path and
+    # body untouched.
+    chat = False
+    target = path if path.startswith("http") else UPSTREAM + path
+    if model is not None:
+        family, family_url = model_protocol(body["model"])
+        if family == "chat":
+            chat = True
+            target = family_url
+        elif family not in ("responses",):
+            raise ValueError(
+                f"model {body['model']!r} uses the {family} protocol; session "
+                "chaining here only supports the chat and responses families "
+                "(systemone models go through evaluate() instead)")
+    if chat:
+        # Wire-fidelity to the captured client frames. Empirical gate rules:
+        # title-shaped bodies (system first, no tools) pass; a main-shaped
+        # 2-message turn needs a prior accepted title request in the same
+        # session; follow-up turns must replay the full client shape - main
+        # system, tools catalog, max_completion_tokens, assistant turns
+        # carrying reasoning_content. A tools-less or title-system follow-up
+        # is an instant FreeTierError. History is preserved for chained
+        # turns; only a history without a system message gains one.
+        instructions = body.get("instructions") or TITLE_INSTRUCTIONS
+        if not isinstance(body.get("messages"), list):
+            first = first_text_of(body)
+            body = {"model": body.get("model"),
+                    "messages": [{"role": "system", "content": instructions},
+                                 {"role": "user", "content": str(first)}],
+                    "stream": True,
+                    "stream_options": {"include_usage": True}}
+        else:
+            messages = list(body["messages"])
+            if not any(m.get("role") == "system" for m in messages):
+                messages.insert(0, {"role": "system", "content": instructions})
+            for m in messages:
+                if isinstance(m, dict) and "prompt_cache_key" in m:
+                    m.pop("prompt_cache_key", None)
+            rebuilt = {"model": body.get("model"), "messages": messages,
+                       "stream": True,
+                       "stream_options": (body.get("stream_options")
+                                          or {"include_usage": True})}
+            for extra in ("tools", "max_completion_tokens"):
+                if body.get(extra) is not None:
+                    rebuilt[extra] = body[extra]
+            body = rebuilt
     out: dict = {"status": 0, "id": None, "model": body.get("model"),
-                 "text": "", "usage": None, "error": None,
+                 "text": "", "reasoning": "", "usage": None, "error": None,
                  "proxy": proxy, "proxy_country": None}
     output_items: list = []
     proxies = _via(proxy) if proxy else None
@@ -202,7 +388,7 @@ def _send(path: str, headers: dict, body: dict, proxy: str | None = None,
         if attempt > 0 and delay_s > 0:
             time.sleep(delay_s)
         try:
-            response = requests.post(UPSTREAM + path, headers=headers, json=body,
+            response = requests.post(target, headers=headers, json=body,
                                      timeout=timeout_s, stream=True, proxies=proxies)
             break
         except Exception as e:  # noqa: BLE001
@@ -236,6 +422,32 @@ def _send(path: str, headers: dict, body: dict, proxy: str | None = None,
             except ValueError:
                 continue
             kind = event.get("type")
+            if chat:
+                # Chat Completions SSE: {"choices":[{"delta":{"content":...}, ...]}],
+                # terminal chunk has "chat.completion" finish_reason style data.
+                if isinstance(event.get("choices"), list) and event["choices"]:
+                    choice = event["choices"][0]
+                    delta = choice.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        out["text"] += piece
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        out["reasoning"] = out.get("reasoning", "") + reasoning
+                    msg = choice.get("message")
+                    if isinstance(msg, dict) and msg.get("content") and not out["text"]:
+                        out["text"] += msg["content"]
+                        if msg.get("reasoning_content"):
+                            out["reasoning"] = out["reasoning"] if isinstance(out.get("reasoning"), str) else ""
+                            out["reasoning"] += msg["reasoning_content"]
+                    finish = choice.get("finish_reason")
+                    if finish and choice.get("id") and not out["id"]:
+                        out["id"] = choice.get("id")
+                if event.get("id") and not out["id"]:
+                    out["id"] = event.get("id")
+                if isinstance(event.get("usage"), dict):
+                    out["usage"] = event["usage"]
+                continue
             if kind == "response.output_text.delta":
                 out["text"] += event.get("delta", "")
             elif kind == "response.completed":
@@ -283,21 +495,70 @@ def mint_session(first_text: str = "hello", proxy: str | None = None,
         "include": ["reasoning.encrypted_content"],
         "reasoning": {"effort": resolved_effort, "summary": "auto"},
     }
-    out = _send(PATH_RESPONSES, _headers(sid, pid), body, proxy,
-                timeout=timeout, retries=retries, retry_delay=retry_delay)
+    headers = _headers(sid, pid)
+    # One 32-hex trace id per session, exactly like the captured client:
+    # its title turn, main turn, and cross-process continuations all share
+    # trace 65de7970... with a fresh span per request. Seed the session
+    # trace here; _send keeps the id and refreshes only the span per call.
+    trace_id = secrets.token_hex(16)
+    span_id = secrets.token_hex(8)
+    headers = dict(headers)
+    headers["traceparent"] = f"00-{trace_id}-{span_id}-01"
+    headers["b3"] = f"{trace_id}-{span_id}-1-{secrets.token_hex(8)}"
+    out = _send(PATH_RESPONSES, headers, body, proxy,
+                timeout=timeout, retries=retries, retry_delay=retry_delay,
+                model=resolved_model)
     out["session_id"], out["project_id"] = sid, pid
+    ok = False
     if out["status"] == 200:
-        with open(_template_path(files_dir), encoding="utf-8") as f:
-            main_base = dict(json.load(f))
-        main_base["prompt_cache_key"] = sid
-        main_base["model"] = resolved_model
-        if isinstance(main_base.get("reasoning"), dict):
-            main_base["reasoning"] = dict(main_base["reasoning"])
-            main_base["reasoning"]["effort"] = resolved_effort
-        main_base["input"] = [body["input"][0]]
-        with open(os.path.join(files_dir, f"session-{sid}.json"), "w", encoding="utf-8") as f:
-            json.dump({"path": PATH_RESPONSES, "headers": _headers(sid, pid),
-                       "body": main_base, "project_id": pid}, f)
+        chain_family, _ = model_protocol(resolved_model)
+        if chain_family == "chat":
+            # The captured client run makes TWO requests for turn 1 on the
+            # same session: a title-shaped gate pass (sent above), then the
+            # main-shape conversation request with the full agent system
+            # prompt, the tool catalog, and max_completion_tokens (the
+            # feed's output limit). Mirror both, in order. The turn-1
+            # assistant reply (reasoning included) is seeded into the
+            # chain so continuations replay history [system, user,
+            # assistant, user...] exactly like the client.
+            main_sys, main_tools = _chat_main_template()
+            meta = ((_models_dev() or {}).get("opencode") or {}).get(
+                "models", {}).get(resolved_model) or {}
+            mtok = (meta.get("limit") or {}).get("output")
+            main_msgs = [{"role": "system", "content": main_sys},
+                         {"role": "user", "content": first_text}]
+            main_body = {"model": resolved_model, "messages": main_msgs,
+                         "tools": main_tools, "stream": True,
+                         "stream_options": {"include_usage": True}}
+            if isinstance(mtok, int):
+                main_body["max_completion_tokens"] = mtok
+            out = _send(model_target(resolved_model), headers, main_body,
+                        proxy, timeout=timeout, retries=retries,
+                        retry_delay=retry_delay, model=resolved_model)
+            out["session_id"], out["project_id"] = sid, pid
+            ok = out["status"] == 200 and bool(out["text"])
+            if ok:
+                assistant = {"role": "assistant", "content": out["text"]}
+                if out.get("reasoning"):
+                    assistant["reasoning_content"] = out["reasoning"]
+                main_msgs.append(assistant)
+            chain_body, chain_path = main_body, model_target(resolved_model)
+        else:
+            with open(_template_path(files_dir), encoding="utf-8") as f:
+                main_base = dict(json.load(f))
+            main_base["prompt_cache_key"] = sid
+            main_base["model"] = resolved_model
+            if isinstance(main_base.get("reasoning"), dict):
+                main_base["reasoning"] = dict(main_base["reasoning"])
+                main_base["reasoning"]["effort"] = resolved_effort
+            main_base["input"] = [body["input"][0]]
+            chain_body = main_base
+            chain_path = PATH_RESPONSES
+            ok = True
+        if ok:
+            with open(os.path.join(files_dir, f"session-{sid}.json"), "w", encoding="utf-8") as f:
+                json.dump({"path": chain_path, "headers": headers,
+                           "body": chain_body, "project_id": pid}, f)
     return out
 
 
@@ -315,10 +576,16 @@ def continue_session(prompt: str, session_id: str, proxy: str | None = None,
         saved = json.load(f)
     full, headers = saved["body"], saved["headers"]
     body = dict(full)
-    body["input"] = list(full["input"]) + [
-        {"type": "message", "role": "user",
-         "content": [{"type": "input_text", "text": prompt}]}]
-    if reasoning_effort is not None:
+    chat = str(saved.get("path", "")).endswith(CHAT_SUFFIX)
+    if chat:
+        msgs = body.get("messages")
+        body["messages"] = list(msgs or []) + [{"role": "user", "content": prompt}]
+        effective_model = body.get("model")
+    else:
+        body["input"] = list(full["input"]) + [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": prompt}]}]
+    if reasoning_effort is not None and not chat:
         if not isinstance(reasoning_effort, str) or not reasoning_effort.strip():
             raise ValueError("reasoning_effort must be a non-empty string")
         if isinstance(body.get("reasoning"), dict):
@@ -329,6 +596,20 @@ def continue_session(prompt: str, session_id: str, proxy: str | None = None,
     out = _send(saved["path"], headers, body, proxy,
                 timeout=timeout, retries=retries, retry_delay=retry_delay)
     items = out.pop("output_items", [])
+    if chat:
+        # Chain bookkeeping on messages: append the assistant turn carrying
+        # its interleaved reasoning (the field interleaved models emit), the
+        # way the client replays it in follow-up turns.
+        out["chain_len"] = len(body["messages"])
+        if out["status"] == 200 and out["text"]:
+            assistant = {"role": "assistant", "content": out["text"]}
+            if out.get("reasoning"):
+                assistant["reasoning_content"] = out["reasoning"]
+            body["messages"] = body["messages"] + [assistant]
+            saved["body"] = body
+            with open(os.path.join(files_dir, f"session-{session_id}.json"), "w", encoding="utf-8") as f:
+                json.dump(saved, f)
+        return out
     out["chain_len"] = len(body["input"])
     if out["status"] == 200 and items:
         chained = dict(full)
